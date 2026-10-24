@@ -1,0 +1,1973 @@
+-- gui v11 (all-in-one: v10 + BananaHUB + NHOOK features)
+-- toggle: RightShift, the "-" button, or the round button on the left
+
+local env = (getgenv and getgenv()) or _G
+if env.EvaCleanup then pcall(env.EvaCleanup) end
+
+local conns = {}
+local alive = true
+local function track(c) table.insert(conns, c) return c end
+
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS        = game:GetService("UserInputService")
+local RS         = game:GetService("ReplicatedStorage")
+local WS         = game:GetService("Workspace")
+local TS         = game:GetService("TweenService")
+local Lighting   = game:GetService("Lighting")
+local LP         = Players.LocalPlayer
+
+-- shared state (flags live in S so there are few top-level locals)
+local S = {
+    standDist = 7, hitRange = 60,
+    limitRange = false, preferRakoof = true, aiTeleport = true,
+}
+local aiPauseUntil = 0
+local stopFly, removePlatform, stopAim, restoreHitbox, restoreLighting, clearESP =
+    function() end, function() end, function() end, function() end, function() end, function() end
+
+-- runs a block safely so one broken feature can't stop the gui
+local function guard(name, fn)
+    local ok, err = pcall(fn)
+    if not ok then warn("[gui] '" .. name .. "' failed: " .. tostring(err)) end
+end
+
+-- starts one background loop per flag (a re-toggle replaces the old loop)
+local function runLoop(key, getWait, fn)
+    S[key .. "_gen"] = (S[key .. "_gen"] or 0) + 1
+    local gen = S[key .. "_gen"]
+    task.spawn(function()
+        while alive and S[key] and S[key .. "_gen"] == gen do
+            pcall(fn)
+            task.wait(getWait())
+        end
+    end)
+end
+
+-- ============ THEME ============
+local C = {
+    bg     = Color3.fromRGB(11, 13, 24),
+    panel  = Color3.fromRGB(17, 20, 36),
+    row    = Color3.fromRGB(22, 26, 46),
+    rowHi  = Color3.fromRGB(32, 38, 66),
+    off    = Color3.fromRGB(44, 50, 80),
+    text   = Color3.fromRGB(232, 236, 250),
+    dim    = Color3.fromRGB(128, 136, 170),
+    a1     = Color3.fromRGB(70, 120, 255),
+    a2     = Color3.fromRGB(110, 190, 255),
+    red    = Color3.fromRGB(255, 90, 110),
+}
+
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    if parent then o.Parent = parent end
+    return o
+end
+local function corner(o, r)
+    return new("UICorner", {CornerRadius = UDim.new(0, r)}, o)
+end
+local function gradient(o, rot)
+    return new("UIGradient", {
+        Color = ColorSequence.new(C.a1, C.a2),
+        Rotation = rot or 0,
+    }, o)
+end
+local function tween(o, t, props)
+    TS:Create(o, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+-- ============ SAFE MOUNT ============
+local function mount(g)
+    if syn and syn.protect_gui then pcall(syn.protect_gui, g) end
+    local targets = {}
+    if gethui then table.insert(targets, function() return gethui() end) end
+    table.insert(targets, function() return game:GetService("CoreGui") end)
+    table.insert(targets, function() return LP:WaitForChild("PlayerGui", 5) end)
+    for _, fn in ipairs(targets) do
+        local ok, p = pcall(fn)
+        if ok and p then
+            local ok2 = pcall(function() g.Parent = p end)
+            if ok2 and g.Parent == p then return p end
+        end
+    end
+    return nil
+end
+
+-- ============ DRAG ============
+local function drag(frame, grip)
+    grip.Active = true
+    local dragging, start, startPos = false, nil, nil
+    track(grip.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, start, startPos = true, i.Position, frame.Position
+        end
+    end))
+    track(UIS.InputChanged:Connect(function(i)
+        if not dragging then return end
+        if i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch then
+            local d = i.Position - start
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                                       startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+    track(UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+end
+
+local function hover(b, base, hi)
+    track(b.MouseEnter:Connect(function() tween(b, 0.12, {BackgroundColor3 = hi}) end))
+    track(b.MouseLeave:Connect(function() tween(b, 0.12, {BackgroundColor3 = base}) end))
+end
+
+-- ============ WINDOW ============
+local gui = new("ScreenGui", {
+    Name = tostring(math.random(100000, 999999)),
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    Enabled = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    DisplayOrder = 999,
+})
+local mountedIn = mount(gui)
+if not mountedIn then
+    warn("[gui] could not find a place to parent the gui")
+    return
+end
+print("[gui] mounted in: " .. mountedIn:GetFullName())
+env.EvaGui = gui
+
+-- size the window to the screen so it can never end up off screen
+local cam = WS.CurrentCamera
+local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+if vp.X < 100 or vp.Y < 100 then vp = Vector2.new(800, 600) end
+local WIN_W  = math.floor(math.min(600, vp.X - 24))
+local WIN_H  = math.floor(math.min(400, vp.Y - 40))
+local SIDE_W = WIN_W < 480 and 118 or 158
+
+local main = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Size = UDim2.new(0, WIN_W, 0, WIN_H),
+    Position = UDim2.new(0.5, 0, 0.5, 0),
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0,
+    Visible = true,
+}, gui)
+corner(main, 14)
+local scale = new("UIScale", {Scale = 1}, main)
+gradient(new("UIStroke", {Thickness = 2, Color = Color3.new(1, 1, 1)}, main), 45)
+new("ImageLabel", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0.5, 0, 0.5, 0),
+    Size = UDim2.new(1, 44, 1, 44),
+    BackgroundTransparency = 1,
+    Image = "rbxassetid://5028857084",
+    ImageColor3 = C.a1,
+    ImageTransparency = 0.7,
+    ScaleType = Enum.ScaleType.Slice,
+    SliceCenter = Rect.new(24, 24, 276, 276),
+    ZIndex = 0,
+}, main)
+
+-- ---------- header ----------
+local header = new("Frame", {Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1}, main)
+drag(main, header)
+
+local logo = new("Frame", {
+    Size = UDim2.new(0, 22, 0, 22),
+    Position = UDim2.new(0, 14, 0.5, -11),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+}, header)
+corner(logo, 7)
+gradient(logo, 45)
+new("Frame", {
+    Size = UDim2.new(0, 8, 0, 8),
+    Position = UDim2.new(0.5, -4, 0.5, -4),
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0,
+}, logo)
+
+local closeBtn = new("TextButton", {
+    Size = UDim2.new(0, 26, 0, 26),
+    Position = UDim2.new(1, -38, 0.5, -13),
+    BackgroundColor3 = C.row,
+    Text = "x",
+    TextColor3 = C.red,
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+}, header)
+corner(closeBtn, 8)
+hover(closeBtn, C.row, C.rowHi)
+
+local hideBtn = new("TextButton", {
+    Size = UDim2.new(0, 26, 0, 26),
+    Position = UDim2.new(1, -70, 0.5, -13),
+    BackgroundColor3 = C.row,
+    Text = "-",
+    TextColor3 = C.text,
+    Font = Enum.Font.GothamBold,
+    TextSize = 16,
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+}, header)
+corner(hideBtn, 8)
+hover(hideBtn, C.row, C.rowHi)
+
+-- ---------- sidebar ----------
+local sidebar = new("Frame", {
+    Position = UDim2.new(0, 10, 0, 44),
+    Size = UDim2.new(0, SIDE_W, 1, -54),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+}, main)
+corner(sidebar, 12)
+
+local searchWrap = new("Frame", {
+    Position = UDim2.new(0, 8, 0, 8),
+    Size = UDim2.new(1, -16, 0, 32),
+    BackgroundColor3 = C.row,
+    BorderSizePixel = 0,
+}, sidebar)
+corner(searchWrap, 8)
+new("UIStroke", {Thickness = 1, Color = C.off, Transparency = 0.2}, searchWrap)
+local mg = new("Frame", {
+    Position = UDim2.new(0, 10, 0.5, -6),
+    Size = UDim2.new(0, 10, 0, 10),
+    BackgroundTransparency = 1,
+}, searchWrap)
+corner(mg, 5)
+new("UIStroke", {Thickness = 1.5, Color = C.dim}, mg)
+local searchBox = new("TextBox", {
+    Position = UDim2.new(0, 28, 0, 0),
+    Size = UDim2.new(1, -34, 1, 0),
+    BackgroundTransparency = 1,
+    Text = "",
+    PlaceholderText = "Search",
+    PlaceholderColor3 = C.dim,
+    TextColor3 = C.text,
+    Font = Enum.Font.GothamMedium,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ClearTextOnFocus = false,
+}, searchWrap)
+
+local tabList = new("ScrollingFrame", {
+    Position = UDim2.new(0, 8, 0, 48),
+    Size = UDim2.new(1, -16, 1, -48 - 56),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 0,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, sidebar)
+new("UIListLayout", {Padding = UDim.new(0, 5)}, tabList)
+
+local userCard = new("Frame", {
+    Position = UDim2.new(0, 8, 1, -52),
+    Size = UDim2.new(1, -16, 0, 44),
+    BackgroundColor3 = C.row,
+    BorderSizePixel = 0,
+}, sidebar)
+corner(userCard, 10)
+local avatar = new("ImageLabel", {
+    Position = UDim2.new(0, 6, 0.5, -16),
+    Size = UDim2.new(0, 32, 0, 32),
+    BackgroundColor3 = C.off,
+    BorderSizePixel = 0,
+    Image = "",
+}, userCard)
+corner(avatar, 16)
+new("TextLabel", {
+    Position = UDim2.new(0, 44, 0, 0),
+    Size = UDim2.new(1, -48, 1, 0),
+    BackgroundTransparency = 1,
+    Text = LP.DisplayName ~= "" and LP.DisplayName or LP.Name,
+    TextColor3 = C.text,
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+}, userCard)
+task.spawn(function()
+    local ok, img = pcall(function()
+        return Players:GetUserThumbnailAsync(LP.UserId,
+            Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+    end)
+    if ok and img and avatar.Parent then avatar.Image = img end
+end)
+
+-- ---------- content area ----------
+local content = new("Frame", {
+    Position = UDim2.new(0, SIDE_W + 20, 0, 44),
+    Size = UDim2.new(1, -(SIDE_W + 30), 1, -54),
+    BackgroundTransparency = 1,
+}, main)
+
+local hpFrame = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 18),
+    BackgroundColor3 = C.row,
+    BorderSizePixel = 0,
+}, content)
+corner(hpFrame, 9)
+local hpFill = new("Frame", {
+    Size = UDim2.new(1, 0, 1, 0),
+    BackgroundColor3 = Color3.fromRGB(80, 220, 140),
+    BorderSizePixel = 0,
+}, hpFrame)
+corner(hpFill, 9)
+local hpText = new("TextLabel", {
+    Size = UDim2.new(1, 0, 1, 0),
+    BackgroundTransparency = 1,
+    Text = "-- / --",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    ZIndex = 3,
+}, hpFrame)
+
+track(RunService.Heartbeat:Connect(function()
+    local char = LP.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.MaxHealth <= 0 then return end
+    local pct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+    hpFill.Size = UDim2.new(pct, 0, 1, 0)
+    hpFill.BackgroundColor3 = Color3.fromRGB(math.floor(255 * (1 - pct)), math.floor(220 * pct), 120)
+    hpText.Text = math.floor(hum.Health) .. " / " .. math.floor(hum.MaxHealth)
+end))
+
+local pageHost = new("Frame", {
+    Position = UDim2.new(0, 0, 0, 26),
+    Size = UDim2.new(1, 0, 1, -26),
+    BackgroundTransparency = 1,
+}, content)
+
+-- ============ TOAST ============
+local toast = new("TextLabel", {
+    AnchorPoint = Vector2.new(0.5, 1),
+    Position = UDim2.new(0.5, 0, 1, -6),
+    Size = UDim2.new(1, -20, 0, 28),
+    BackgroundColor3 = C.panel,
+    BackgroundTransparency = 1,
+    TextTransparency = 1,
+    Text = "",
+    TextColor3 = C.text,
+    Font = Enum.Font.GothamMedium,
+    TextSize = 11,
+    BorderSizePixel = 0,
+    ZIndex = 8,
+}, content)
+corner(toast, 8)
+local toastId = 0
+local function notify(msg)
+    toastId = toastId + 1
+    local id = toastId
+    toast.Text = msg
+    tween(toast, 0.15, {BackgroundTransparency = 0.05, TextTransparency = 0})
+    task.delay(2.2, function()
+        if toastId == id then
+            tween(toast, 0.3, {BackgroundTransparency = 1, TextTransparency = 1})
+        end
+    end)
+end
+
+-- ============ TABS + SEARCH ============
+local tabs, pages, registry = {}, {}, {}
+local currentTab
+
+local function reg(page, frame, key, isHeading)
+    registry[page] = registry[page] or {}
+    table.insert(registry[page], {frame = frame, key = (key or ""):lower(), heading = isHeading})
+end
+
+local function applyFilter()
+    local page = pages[currentTab]
+    if not page then return end
+    local q = (searchBox.Text or ""):lower()
+    for _, e in ipairs(registry[page] or {}) do
+        if q == "" then
+            e.frame.Visible = true
+        elseif e.heading then
+            e.frame.Visible = false
+        else
+            e.frame.Visible = e.key:find(q, 1, true) ~= nil
+        end
+    end
+end
+track(searchBox:GetPropertyChangedSignal("Text"):Connect(applyFilter))
+
+local function selectTab(name)
+    currentTab = name
+    for n, page in pairs(pages) do
+        local on = (n == name)
+        page.Visible = on
+        local t = tabs[n]
+        tween(t.btn, 0.15, {BackgroundColor3 = on and C.rowHi or C.row})
+        tween(t.stroke, 0.15, {Transparency = on and 0.1 or 1})
+        tween(t.txt, 0.15, {TextColor3 = on and C.text or C.dim})
+    end
+    applyFilter()
+end
+
+local function addTab(name, letter)
+    local b = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 34),
+        BackgroundColor3 = C.row,
+        Text = "",
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+    }, tabList)
+    corner(b, 9)
+    local stroke = new("UIStroke", {Thickness = 1.2, Color = C.a1, Transparency = 1}, b)
+    local icon = new("Frame", {
+        Size = UDim2.new(0, 20, 0, 20),
+        Position = UDim2.new(0, 8, 0.5, -10),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, b)
+    corner(icon, 6)
+    gradient(icon, 45)
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Text = letter,
+        TextColor3 = Color3.new(1, 1, 1),
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+    }, icon)
+    local txt = new("TextLabel", {
+        Size = UDim2.new(1, -40, 1, 0),
+        Position = UDim2.new(0, 36, 0, 0),
+        BackgroundTransparency = 1,
+        Text = name,
+        TextColor3 = C.dim,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, b)
+
+    local page = new("ScrollingFrame", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = C.a1,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        Visible = false,
+    }, pageHost)
+    new("UIListLayout", {Padding = UDim.new(0, 6)}, page)
+    new("UIPadding", {PaddingRight = UDim.new(0, 8), PaddingBottom = UDim.new(0, 38)}, page)
+
+    tabs[name], pages[name] = {btn = b, stroke = stroke, txt = txt}, page
+    track(b.MouseButton1Click:Connect(function() selectTab(name) end))
+    return page
+end
+
+-- ============ WIDGETS ============
+local function rowBase(page, h, key)
+    local r = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, h),
+        BackgroundColor3 = C.row,
+        Text = "",
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+    }, page)
+    corner(r, 9)
+    new("UIStroke", {Thickness = 1, Color = C.off, Transparency = 0.5}, r)
+    local bar = new("Frame", {
+        Position = UDim2.new(0, 0, 0.5, -9),
+        Size = UDim2.new(0, 3, 0, 18),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, r)
+    corner(bar, 2)
+    gradient(bar, 90)
+    reg(page, r, key, false)
+    return r
+end
+
+local function rowLabel(parent, text, rightPad)
+    return new("TextLabel", {
+        Size = UDim2.new(1, -(rightPad or 60), 1, 0),
+        Position = UDim2.new(0, 14, 0, 0),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = C.text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, parent)
+end
+
+local function heading(page, text)
+    local l = new("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 20),
+        BackgroundTransparency = 1,
+        Text = string.upper(text),
+        TextColor3 = C.a2,
+        Font = Enum.Font.GothamBold,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, page)
+    reg(page, l, text, true)
+end
+
+local function info(page, text)
+    local l = new("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 30),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = C.dim,
+        Font = Enum.Font.Gotham,
+        TextSize = 11,
+        TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, page)
+    reg(page, l, text, true)
+end
+
+local function button(page, text, cb)
+    local r = rowBase(page, 38, text)
+    hover(r, C.row, C.rowHi)
+    rowLabel(r, text, 56)
+    local run = new("Frame", {
+        Size = UDim2.new(0, 26, 0, 22),
+        Position = UDim2.new(1, -36, 0.5, -11),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, r)
+    corner(run, 7)
+    gradient(run, 45)
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Text = ">",
+        TextColor3 = Color3.new(1, 1, 1),
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+    }, run)
+    track(r.MouseButton1Click:Connect(function()
+        local ok, err = pcall(cb)
+        if not ok then warn("[gui] " .. tostring(err)) end
+    end))
+    return r
+end
+
+local function toggle(page, text, cb)
+    local r = rowBase(page, 38, text)
+    hover(r, C.row, C.rowHi)
+    rowLabel(r, text, 64)
+    local sw = new("Frame", {
+        Size = UDim2.new(0, 38, 0, 20),
+        Position = UDim2.new(1, -50, 0.5, -10),
+        BackgroundColor3 = C.off,
+        BorderSizePixel = 0,
+    }, r)
+    corner(sw, 10)
+    local sg = gradient(sw, 0)
+    sg.Enabled = false
+    local knob = new("Frame", {
+        Size = UDim2.new(0, 14, 0, 14),
+        Position = UDim2.new(0, 3, 0.5, -7),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, sw)
+    corner(knob, 7)
+    local stroke = r:FindFirstChildOfClass("UIStroke")
+
+    local state = false
+    local function set(v, silent)
+        state = v
+        sg.Enabled = v
+        if not v then tween(sw, 0.15, {BackgroundColor3 = C.off})
+        else sw.BackgroundColor3 = Color3.new(1, 1, 1) end
+        if stroke then
+            tween(stroke, 0.15, {Color = v and C.a1 or C.off, Transparency = v and 0.15 or 0.5})
+        end
+        tween(knob, 0.15, {Position = v and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)})
+        if not silent then
+            local ok, err = pcall(cb, v)
+            if not ok then warn("[gui] " .. tostring(err)) end
+        end
+    end
+    track(r.MouseButton1Click:Connect(function() set(not state) end))
+    return set
+end
+
+local function slider(page, text, mn, mx, def, cb)
+    local r = rowBase(page, 52, text)
+    rowLabel(r, text, 70).Position = UDim2.new(0, 14, 0, -8)
+    local val = new("TextLabel", {
+        Size = UDim2.new(0, 56, 0, 18),
+        Position = UDim2.new(1, -68, 0, 7),
+        BackgroundTransparency = 1,
+        Text = tostring(def),
+        TextColor3 = C.a2,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Right,
+    }, r)
+    local bar = new("Frame", {
+        Size = UDim2.new(1, -28, 0, 6),
+        Position = UDim2.new(0, 14, 0, 36),
+        BackgroundColor3 = C.off,
+        BorderSizePixel = 0,
+    }, r)
+    corner(bar, 3)
+    local startA = (def - mn) / (mx - mn)
+    local fill = new("Frame", {
+        Size = UDim2.new(startA, 0, 1, 0),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, bar)
+    corner(fill, 3)
+    gradient(fill, 0)
+    local knob = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(startA, 0, 0.5, 0),
+        Size = UDim2.new(0, 12, 0, 12),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        ZIndex = 2,
+    }, bar)
+    corner(knob, 6)
+    local hit = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 26),
+        Position = UDim2.new(0, 0, 0.5, -13),
+        BackgroundTransparency = 1,
+        Text = "",
+    }, bar)
+
+    local dragging = false
+    local function setFromX(x)
+        local a = math.clamp((x - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
+        local v = math.floor(mn + (mx - mn) * a + 0.5)
+        fill.Size = UDim2.new(a, 0, 1, 0)
+        knob.Position = UDim2.new(a, 0, 0.5, 0)
+        val.Text = tostring(v)
+        pcall(cb, v)
+    end
+    track(hit.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            setFromX(i.Position.X)
+        end
+    end))
+    track(UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
+            setFromX(i.Position.X)
+        end
+    end))
+    track(UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+end
+
+-- text box + run button on one row
+local function inputButton(page, placeholder, default, btnText, cb)
+    local r = rowBase(page, 38, placeholder .. " " .. btnText)
+    local box = new("TextBox", {
+        Position = UDim2.new(0, 14, 0.5, -12),
+        Size = UDim2.new(1, -112, 0, 24),
+        BackgroundColor3 = C.bg,
+        Text = default,
+        PlaceholderText = placeholder,
+        PlaceholderColor3 = C.dim,
+        TextColor3 = C.text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 12,
+        ClearTextOnFocus = false,
+        BorderSizePixel = 0,
+    }, r)
+    corner(box, 6)
+    local run = new("TextButton", {
+        Size = UDim2.new(0, 66, 0, 24),
+        Position = UDim2.new(1, -76, 0.5, -12),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        Text = btnText,
+        TextColor3 = Color3.new(1, 1, 1),
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+    }, r)
+    corner(run, 7)
+    gradient(run, 45)
+    track(run.MouseButton1Click:Connect(function()
+        local ok, err = pcall(cb, box.Text)
+        if not ok then warn("[gui] " .. tostring(err)) end
+    end))
+end
+
+-- ============ HELPERS ============
+local function getRoot()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart"), c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function isRemote(d)
+    return d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("BindableEvent")
+end
+
+local function findRemote(names)
+    local pool = {}
+    for _, n in ipairs(names) do
+        local hit = RS:FindFirstChild(n, true) or WS:FindFirstChild(n, true)
+        if hit then table.insert(pool, hit) end
+    end
+    local rake = WS:FindFirstChild("the_rake", true)
+    if rake then
+        for _, d in ipairs(rake:GetDescendants()) do
+            if isRemote(d) then table.insert(pool, d) end
+        end
+    end
+    for _, d in ipairs(RS:GetDescendants()) do
+        if isRemote(d) and d.Name:lower():find("startmode") then
+            table.insert(pool, d)
+        end
+    end
+    return pool
+end
+
+local function touch(root, part)
+    if firetouchinterest then
+        pcall(firetouchinterest, root, part, 0)
+        pcall(firetouchinterest, root, part, 1)
+    elseif not part.Anchored then
+        pcall(function() part.CFrame = root.CFrame end)
+    end
+end
+
+local function activateTool()
+    local c = LP.Character
+    local tool = c and c:FindFirstChildOfClass("Tool")
+    if tool then pcall(function() tool:Activate() end) end
+end
+
+-- ---------- rakoof / enemy targeting (shared by many features) ----------
+local function validTarget(m)
+    if not m or not m.Parent then return false end
+    local h = m:FindFirstChildOfClass("Humanoid")
+    if h and h.Health <= 0 then return false end
+    return true
+end
+
+local function partOf(m)
+    return m:FindFirstChild("HumanoidRootPart")
+        or m.PrimaryPart
+        or m:FindFirstChildWhichIsA("BasePart", true)
+end
+
+-- model named like "rakoof"; falls back to a living "rake" model with a Humanoid
+local function scan(list)
+    local fallback
+    for _, d in ipairs(list) do
+        if d:IsA("Model") and not Players:GetPlayerFromCharacter(d) then
+            local h = d:FindFirstChildOfClass("Humanoid")
+            if not h or h.Health > 0 then
+                local n = d.Name:lower()
+                if n:find("rakoof") then
+                    return d
+                elseif not fallback and h and n:find("rake") then
+                    fallback = d
+                end
+            end
+        end
+    end
+    return fallback
+end
+
+local rakoofCache, lastDeep = nil, 0
+local function getRakoof()
+    if validTarget(rakoofCache) then return rakoofCache end
+    rakoofCache = scan(WS:GetChildren())
+    if not rakoofCache and tick() - lastDeep > 2 then
+        lastDeep = tick()
+        rakoofCache = scan(WS:GetDescendants())
+    end
+    return rakoofCache
+end
+
+local function nearestEnemy(root, useLimit)
+    local best, bestPart, bestD = nil, nil, math.huge
+    for _, m in ipairs(WS:GetChildren()) do
+        if m:IsA("Model") and m ~= LP.Character then
+            local mh = m:FindFirstChildOfClass("Humanoid")
+            local mr = m:FindFirstChild("HumanoidRootPart")
+            if mh and mr and mh.Health > 0 and Players:GetPlayerFromCharacter(m) == nil then
+                local d = (mr.Position - root.Position).Magnitude
+                if (not useLimit or d <= S.hitRange) and d < bestD then
+                    bestD, best, bestPart = d, m, mr
+                end
+            end
+        end
+    end
+    return best, bestPart
+end
+
+local function pickTarget(root, useLimit)
+    if S.preferRakoof then
+        local rk = getRakoof()
+        local rp = rk and partOf(rk)
+        if rp and (not useLimit or (rp.Position - root.Position).Magnitude <= S.hitRange) then
+            return rk, rp
+        end
+    end
+    return nearestEnemy(root, useLimit)
+end
+
+-- ============ PAGES ============
+local pMove     = addTab("Movement", "M")
+local pCombat   = addTab("Combat", "C")
+local pFarm     = addTab("Farm", "F")
+local pPlayer   = addTab("Player", "P")
+local pVis      = addTab("Visuals", "V")
+local pSettings = addTab("Settings", "S")
+selectTab("Movement")
+
+-- ============ REMOVE CONFIRM (are you sure?) ============
+local confirm = new("Frame", {
+    Size = UDim2.new(1, 0, 1, 0),
+    BackgroundColor3 = Color3.new(0, 0, 0),
+    BackgroundTransparency = 0.4,
+    Visible = false,
+    ZIndex = 50,
+    Active = true,
+}, main)
+corner(confirm, 14)
+
+local card = new("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0.5, 0, 0.5, 0),
+    Size = UDim2.new(0, math.min(300, WIN_W - 40), 0, 138),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel = 0,
+}, confirm)
+corner(card, 12)
+gradient(new("UIStroke", {Thickness = 1.5, Color = Color3.new(1, 1, 1)}, card), 45)
+local cardScale = new("UIScale", {Scale = 1}, card)
+
+new("TextLabel", {
+    Size = UDim2.new(1, -24, 0, 24),
+    Position = UDim2.new(0, 12, 0, 14),
+    BackgroundTransparency = 1,
+    Text = "Remove script?",
+    TextColor3 = C.text,
+    Font = Enum.Font.GothamBold,
+    TextSize = 15,
+}, card)
+new("TextLabel", {
+    Size = UDim2.new(1, -24, 0, 36),
+    Position = UDim2.new(0, 12, 0, 42),
+    BackgroundTransparency = 1,
+    Text = "Are you sure you want to remove it?",
+    TextColor3 = C.dim,
+    Font = Enum.Font.GothamMedium,
+    TextSize = 12,
+    TextWrapped = true,
+}, card)
+
+local noBtn = new("TextButton", {
+    Size = UDim2.new(0.5, -18, 0, 34),
+    Position = UDim2.new(0, 12, 1, -46),
+    BackgroundColor3 = C.row,
+    Text = "Cancel",
+    TextColor3 = C.text,
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+}, card)
+corner(noBtn, 8)
+hover(noBtn, C.row, C.rowHi)
+
+local yesBtn = new("TextButton", {
+    Size = UDim2.new(0.5, -18, 0, 34),
+    Position = UDim2.new(0.5, 6, 1, -46),
+    BackgroundColor3 = C.red,
+    Text = "Yes, remove",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+}, card)
+corner(yesBtn, 8)
+
+local function askRemove()
+    confirm.Visible = true
+    cardScale.Scale = 0.9
+    tween(cardScale, 0.15, {Scale = 1})
+end
+track(noBtn.MouseButton1Click:Connect(function() confirm.Visible = false end))
+track(yesBtn.MouseButton1Click:Connect(function()
+    if env.EvaCleanup then env.EvaCleanup() end
+end))
+
+-- ============ TOGGLE (pill + RightShift) - built early so the gui is always usable ============
+local pill = new("TextButton", {
+    Size = UDim2.new(0, 42, 0, 42),
+    Position = UDim2.new(0, 16, 0.5, -21),
+    BackgroundColor3 = C.panel,
+    Text = "",
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+    ZIndex = 5,
+}, gui)
+corner(pill, 21)
+gradient(new("UIStroke", {Thickness = 2, Color = Color3.new(1, 1, 1)}, pill), 45)
+local pd = new("Frame", {
+    Size = UDim2.new(0, 14, 0, 14),
+    Position = UDim2.new(0.5, -7, 0.5, -7),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+    ZIndex = 6,
+}, pill)
+corner(pd, 7)
+gradient(pd, 45)
+
+local pillMoved = false
+do
+    local dragging, start, startPos = false, nil, nil
+    track(pill.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, start, startPos = true, i.Position, pill.Position
+            pillMoved = false
+        end
+    end))
+    track(UIS.InputChanged:Connect(function(i)
+        if not dragging then return end
+        if i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch then
+            local d = i.Position - start
+            if d.Magnitude > 5 then pillMoved = true end
+            if pillMoved then
+                pill.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                                          startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end
+    end))
+    track(UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+end
+
+local isVisible = true
+local function setVisible(v)
+    isVisible = v
+    if v then
+        main.Visible = true
+        scale.Scale = 0.9
+        tween(scale, 0.18, {Scale = 1})
+    else
+        tween(scale, 0.15, {Scale = 0.9})
+        task.delay(0.16, function()
+            if not isVisible and main.Parent then main.Visible = false end
+        end)
+    end
+end
+
+track(pill.MouseButton1Click:Connect(function()
+    if pillMoved then return end
+    setVisible(not isVisible)
+end))
+track(hideBtn.MouseButton1Click:Connect(function() setVisible(false) end))
+track(closeBtn.MouseButton1Click:Connect(askRemove))
+
+track(UIS.InputBegan:Connect(function(i)
+    if i.KeyCode ~= Enum.KeyCode.RightShift then return end
+    if UIS:GetFocusedTextBox() then return end
+    setVisible(not isVisible)
+end))
+
+-- ============ CLEANUP (also built early) ============
+env.EvaCleanup = function()
+    alive = false
+    for k, v in pairs(S) do
+        if type(v) == "boolean" then S[k] = false end
+    end
+    pcall(stopFly)
+    pcall(stopAim)
+    pcall(restoreHitbox)
+    pcall(restoreLighting)
+    pcall(clearESP)
+    pcall(removePlatform)
+    for _, c in ipairs(conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    pcall(function() gui:Destroy() end)
+    env.EvaCleanup = nil
+end
+
+-- watchdog: if the game removes the gui, put it back
+task.spawn(function()
+    while alive do
+        task.wait(2)
+        if alive and not gui.Parent then mount(gui) end
+    end
+end)
+
+-- ============ MOVEMENT TAB ============
+guard("movement", function()
+    -- ---- FLY ----
+    local flyOn, flyCon, flyBV, flyBG = false, nil, nil, nil
+    stopFly = function()
+        flyOn = false
+        if flyCon then flyCon:Disconnect(); flyCon = nil end
+        if flyBV then flyBV:Destroy(); flyBV = nil end
+        if flyBG then flyBG:Destroy(); flyBG = nil end
+    end
+
+    local setFlyUI
+    local function startFly()
+        local root = getRoot()
+        if not root then return false end
+        flyOn = true
+        flyBV = new("BodyVelocity", {MaxForce = Vector3.new(1e5, 1e5, 1e5), Velocity = Vector3.zero}, root)
+        flyBG = new("BodyGyro", {MaxTorque = Vector3.new(1e5, 1e5, 1e5), P = 1000, CFrame = root.CFrame}, root)
+        flyCon = RunService.Heartbeat:Connect(function()
+            local r = getRoot()
+            local cm = WS.CurrentCamera
+            if not r or not cm or not flyOn then return end
+            local dir = Vector3.zero
+            if UIS:IsKeyDown(Enum.KeyCode.W) then dir = dir + cm.CFrame.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.S) then dir = dir - cm.CFrame.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.A) then dir = dir - cm.CFrame.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.D) then dir = dir + cm.CFrame.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.Space) then dir = dir + Vector3.new(0, 1, 0) end
+            if UIS:IsKeyDown(Enum.KeyCode.LeftShift) then dir = dir - Vector3.new(0, 1, 0) end
+            if dir.Magnitude > 0 then dir = dir.Unit * 60 end
+            if flyBV then flyBV.Velocity = dir end
+            if flyBG then flyBG.CFrame = cm.CFrame end
+        end)
+        track(flyCon)
+        return true
+    end
+
+    heading(pMove, "Movement")
+    setFlyUI = toggle(pMove, "Fly  (WASD / Space / Shift)", function(v)
+        if v then
+            if not startFly() then setFlyUI(false, true) end
+        else
+            stopFly()
+        end
+    end)
+    track(LP.CharacterAdded:Connect(function()
+        stopFly()
+        setFlyUI(false, true)
+    end))
+
+    -- ---- SPEED ----
+    local speedVal = 50
+    toggle(pMove, "Walk Speed", function(v)
+        S.speed = v
+        if not v then
+            local _, hum = getRoot()
+            if hum then hum.WalkSpeed = 16 end
+        end
+    end)
+    slider(pMove, "Speed Amount", 16, 200, speedVal, function(v) speedVal = v end)
+    track(RunService.Heartbeat:Connect(function()
+        if not S.speed then return end
+        local _, hum = getRoot()
+        if hum then hum.WalkSpeed = speedVal end
+    end))
+
+    -- ---- JUMP ----
+    local jumpVal = 100
+    toggle(pMove, "Jump Power", function(v)
+        S.jump = v
+        if not v then
+            local _, hum = getRoot()
+            if hum then hum.JumpPower = 50 end
+        end
+    end)
+    slider(pMove, "Jump Amount", 50, 300, jumpVal, function(v) jumpVal = v end)
+    track(RunService.Heartbeat:Connect(function()
+        if not S.jump then return end
+        local _, hum = getRoot()
+        if hum then
+            hum.UseJumpPower = true
+            hum.JumpPower = jumpVal
+        end
+    end))
+
+    toggle(pMove, "Infinite Jump", function(v) S.infJump = v end)
+    track(UIS.JumpRequest:Connect(function()
+        if not S.infJump then return end
+        local _, hum = getRoot()
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end))
+
+    toggle(pMove, "Ghost Walk (noclip)", function(v) S.ghost = v end)
+    track(RunService.Stepped:Connect(function()
+        if not S.ghost then return end
+        local c = LP.Character
+        if not c then return end
+        for _, p in ipairs(c:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+        end
+    end))
+end)
+
+guard("sky", function()
+    heading(pMove, "Sky")
+    local skyHeight   = 500
+    local skyPlatform = nil
+    local skyReturnCF = nil
+
+    removePlatform = function()
+        if skyPlatform then
+            pcall(function() skyPlatform:Destroy() end)
+            skyPlatform = nil
+        end
+    end
+
+    local function makePlatform(cf)
+        removePlatform()
+        local p = new("Part", {
+            Name = tostring(math.random(100000, 999999)),
+            Size = Vector3.new(60, 2, 60),
+            Anchored = true,
+            CanCollide = true,
+            Material = Enum.Material.Neon,
+            Color = C.a1,
+            Transparency = 0.35,
+            TopSurface = Enum.SurfaceType.Smooth,
+            BottomSurface = Enum.SurfaceType.Smooth,
+            CFrame = cf,
+        }, WS)
+        new("SelectionBox", {
+            Adornee = p,
+            LineThickness = 0.08,
+            Color3 = C.a2,
+            SurfaceTransparency = 1,
+        }, p)
+        new("PointLight", {Color = C.a2, Range = 30, Brightness = 2}, p)
+        TS:Create(p, TweenInfo.new(1.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+            {Transparency = 0.6}):Play()
+        skyPlatform = p
+    end
+
+    slider(pMove, "Sky Height", 50, 2000, skyHeight, function(v) skyHeight = v end)
+
+    button(pMove, "Teleport to Sky", function()
+        local root = getRoot()
+        if not root then return end
+        if not skyReturnCF then skyReturnCF = root.CFrame end
+        local base = skyReturnCF.Position
+        local pos = Vector3.new(base.X, base.Y + skyHeight, base.Z)
+        makePlatform(CFrame.new(pos - Vector3.new(0, 4, 0)))
+        root.CFrame = CFrame.new(pos)
+        root.AssemblyLinearVelocity = Vector3.zero
+    end)
+
+    button(pMove, "Return From Sky", function()
+        local root = getRoot()
+        if root and skyReturnCF then
+            root.CFrame = skyReturnCF + Vector3.new(0, 3, 0)
+            root.AssemblyLinearVelocity = Vector3.zero
+        end
+        skyReturnCF = nil
+        removePlatform()
+    end)
+end)
+
+-- ============ COMBAT TAB ============
+guard("combat", function()
+    -- ---- AUTO RAKOOF ----
+    heading(pCombat, "Auto Rakoof")
+    local aiCon = nil
+
+    toggle(pCombat, "Auto Rakoof", function(v)
+        S.ai = v
+        if aiCon then aiCon:Disconnect(); aiCon = nil end
+        if not v then return end
+        aiCon = RunService.RenderStepped:Connect(function()
+            if tick() < aiPauseUntil then return end
+            local char = LP.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if not root then return end
+
+            local m, mr = pickTarget(root, S.limitRange)
+            if not m or not mr then return end
+
+            if S.aiTeleport then
+                local target = mr.Position + (mr.CFrame.LookVector * -1) * S.standDist + Vector3.new(0, 2, 0)
+                root.CFrame = CFrame.new(target, mr.Position)
+            end
+            activateTool()
+        end)
+        track(aiCon)
+    end)
+
+    local setRF = toggle(pCombat, "Rakoof First", function(v) S.preferRakoof = v end)
+    setRF(true)
+    local setTPEnemy = toggle(pCombat, "Teleport to Enemy", function(v) S.aiTeleport = v end)
+    setTPEnemy(true)
+    toggle(pCombat, "Limit Hit Range", function(v) S.limitRange = v end)
+    slider(pCombat, "Hit Range (studs)", 5, 500, S.hitRange, function(v) S.hitRange = v end)
+    slider(pCombat, "Stand Distance", 3, 20, S.standDist, function(v) S.standDist = v end)
+
+    -- ---- OTHER ATTACK MODES ----
+    heading(pCombat, "Attack Modes")
+
+    local orbitAngle, orbitR = 0, 8
+    toggle(pCombat, "Orbit Rakoof", function(v) S.orbit = v end)
+    slider(pCombat, "Orbit Radius", 3, 40, orbitR, function(v) orbitR = v end)
+    track(RunService.RenderStepped:Connect(function(dt)
+        if not S.orbit or tick() < aiPauseUntil then return end
+        local root = getRoot()
+        local rk = getRakoof()
+        local rp = rk and partOf(rk)
+        if not root or not rp then return end
+        orbitAngle = orbitAngle + dt * 5
+        local p = rp.Position + Vector3.new(math.cos(orbitAngle) * orbitR, 3, math.sin(orbitAngle) * orbitR)
+        root.CFrame = CFrame.new(p, rp.Position)
+        activateTool()
+    end))
+
+    toggle(pCombat, "Auto Farm (above Rakoof)", function(v) S.farmAbove = v end)
+    track(RunService.RenderStepped:Connect(function()
+        if not S.farmAbove or tick() < aiPauseUntil then return end
+        local root = getRoot()
+        local rk = getRakoof()
+        local rp = rk and partOf(rk)
+        if not root or not rp then return end
+        root.CFrame = CFrame.new(rp.Position + Vector3.new(0, 5, 0), rp.Position)
+        activateTool()
+    end))
+
+    toggle(pCombat, "Bring Rakoof to Me", function(v) S.bringBoss = v end)
+    track(RunService.Heartbeat:Connect(function()
+        if not S.bringBoss then return end
+        local root = getRoot()
+        local rk = getRakoof()
+        local rp = rk and partOf(rk)
+        if root and rp then rp.CFrame = root.CFrame * CFrame.new(0, 0, -S.standDist) end
+    end))
+
+    toggle(pCombat, "Fast Spam Clicker", function(v) S.spam = v end)
+    track(RunService.RenderStepped:Connect(function()
+        if S.spam then activateTool() end
+    end))
+
+    toggle(pCombat, "Trigger Bot (click on Rakoof)", function(v) S.trig = v end)
+    track(RunService.Heartbeat:Connect(function()
+        if not S.trig then return end
+        local t = LP:GetMouse().Target
+        local m = t and t:FindFirstAncestorOfClass("Model")
+        if m and (m == getRakoof() or m.Name:lower():find("rake")) then activateTool() end
+    end))
+
+    -- ---- INFINITE REACH ----
+    heading(pCombat, "Reach")
+    local reachDist = 100
+    toggle(pCombat, "Infinite Reach", function(v)
+        S.reach = v
+        if v then
+            runLoop("reach", function() return 0.1 end, function()
+                local c = LP.Character
+                local tool = c and c:FindFirstChildOfClass("Tool")
+                local handle = tool and (tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart"))
+                local rk = getRakoof()
+                local rp = rk and partOf(rk)
+                if handle and rp and (handle.Position - rp.Position).Magnitude <= reachDist then
+                    if firetouchinterest then
+                        firetouchinterest(rp, handle, 0)
+                        firetouchinterest(rp, handle, 1)
+                    end
+                    tool:Activate()
+                end
+            end)
+        end
+    end)
+    slider(pCombat, "Reach Distance", 5, 300, reachDist, function(v) reachDist = v end)
+
+    -- ---- RAKOOF HITBOX ----
+    heading(pCombat, "Rakoof Hitbox")
+    local hbAll, hbShow, hbSize = false, true, 25
+    local hbOriginal, hbModel = {}, nil
+
+    local function hbRestore()
+        for part, o in pairs(hbOriginal) do
+            if part and part.Parent then
+                pcall(function()
+                    part.Size = o.Size
+                    part.Transparency = o.Transparency
+                    part.CanCollide = o.CanCollide
+                    part.Massless = o.Massless
+                end)
+            end
+        end
+        hbOriginal, hbModel = {}, nil
+    end
+    restoreHitbox = hbRestore
+
+    local function hbApply(part)
+        if not hbOriginal[part] then
+            hbOriginal[part] = {
+                Size = part.Size,
+                Transparency = part.Transparency,
+                CanCollide = part.CanCollide,
+                Massless = part.Massless,
+            }
+        end
+        local o = hbOriginal[part]
+        local want = o.Size + Vector3.new(hbSize, hbSize, hbSize)
+        if part.Size ~= want then part.Size = want end
+        part.CanCollide = false
+        part.Massless = true
+        part.Transparency = hbShow and math.max(0.55, o.Transparency) or o.Transparency
+    end
+
+    task.spawn(function()
+        while alive do
+            task.wait(0.25)
+            if S.hb then
+                local m = getRakoof()
+                if m then
+                    if hbModel ~= m then
+                        hbRestore()
+                        hbModel = m
+                    end
+                    if hbAll then
+                        for _, p in ipairs(m:GetDescendants()) do
+                            if p:IsA("BasePart") then pcall(hbApply, p) end
+                        end
+                    else
+                        local rp = partOf(m)
+                        if rp then pcall(hbApply, rp) end
+                    end
+                elseif hbModel then
+                    hbRestore()
+                end
+            end
+        end
+    end)
+
+    toggle(pCombat, "Expand Rakoof Hitbox", function(v)
+        S.hb = v
+        if not v then hbRestore() end
+    end)
+    slider(pCombat, "Hitbox Size", 1, 100, hbSize, function(v) hbSize = v end)
+    local setHbShow = toggle(pCombat, "Show Hitbox", function(v)
+        hbShow = v
+        if S.hb then hbRestore() end
+    end)
+    setHbShow(true)
+    toggle(pCombat, "All Parts", function(v)
+        hbAll = v
+        if S.hb then hbRestore() end
+    end)
+
+    -- ---- AIM LOCK ----
+    heading(pCombat, "Aim Lock")
+    local aimStrength, aimHead = 100, false
+    local aimTarget, aimPart, aimAt = nil, nil, 0
+    local AIM_BIND = "eva_aim_" .. tostring(math.random(1000, 9999))
+
+    local function aimStep()
+        local cm = WS.CurrentCamera
+        local root = getRoot()
+        if not cm or not root then return end
+        if tick() - aimAt > 0.25 or not (aimPart and aimPart.Parent) then
+            aimAt = tick()
+            aimTarget, aimPart = pickTarget(root, false)
+        end
+        if not aimPart then return end
+        local pos = aimPart.Position
+        if aimHead and aimTarget then
+            local h = aimTarget:FindFirstChild("Head")
+            if h and h:IsA("BasePart") then pos = h.Position end
+        end
+        local goal = CFrame.new(cm.CFrame.Position, pos)
+        local a = aimStrength / 100
+        cm.CFrame = (a >= 1) and goal or cm.CFrame:Lerp(goal, a)
+    end
+
+    stopAim = function()
+        S.aim = false
+        pcall(function() RunService:UnbindFromRenderStep(AIM_BIND) end)
+    end
+
+    toggle(pCombat, "Aim Lock (Rakoof)", function(v)
+        stopAim()
+        if not v then return end
+        S.aim = true
+        aimAt = 0
+        local ok = pcall(function()
+            RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 1, aimStep)
+        end)
+        if ok then
+            notify("Aim lock on")
+        else
+            S.aim = false
+            notify("Aim lock failed to start")
+        end
+    end)
+    slider(pCombat, "Lock Strength", 5, 100, aimStrength, function(v) aimStrength = v end)
+    toggle(pCombat, "Aim at Head", function(v) aimHead = v end)
+
+    -- ---- TELEPORT ----
+    heading(pCombat, "Teleport")
+    button(pCombat, "Teleport to Rakoof", function()
+        local m = getRakoof()
+        if not m then notify("Rakoof not found") return end
+        local root = getRoot()
+        if not root then return end
+        local ok, cf = pcall(function() return m:GetPivot() end)
+        if not ok then notify("Couldn't read Rakoof's position") return end
+        local target = cf.Position + (cf.LookVector * -1) * S.standDist + Vector3.new(0, 2, 0)
+        root.CFrame = CFrame.new(target, cf.Position)
+        root.AssemblyLinearVelocity = Vector3.zero
+        aiPauseUntil = tick() + 1.5
+    end)
+
+    -- ---- BOSS MODE ----
+    heading(pCombat, "Boss Mode")
+    button(pCombat, "Trigger StartMode (remote)", function()
+        local hits = findRemote({"StartMode", "startmode", "StartModeRemote"})
+        if #hits == 0 then notify("No StartMode remote found") return end
+        for _, r in ipairs(hits) do
+            pcall(function()
+                if r:IsA("RemoteEvent") then
+                    r:FireServer("HellsAwakening")
+                    r:FireServer("HellsAwakeningMain")
+                elseif r:IsA("RemoteFunction") then
+                    r:InvokeServer("HellsAwakening")
+                elseif r:IsA("BindableEvent") then
+                    r:Fire("HellsAwakening")
+                end
+            end)
+        end
+    end)
+
+    inputButton(pCombat, "Script name", "MainBloodHour", "START", function(text)
+        local target = (text:gsub("%s+", ""))
+        if target == "" then notify("Type a script name first") return end
+        local found = false
+        for _, obj in ipairs(WS:GetDescendants()) do
+            if obj.Name == target then
+                found = true
+                pcall(function()
+                    if obj:IsA("Script") or obj:IsA("LocalScript") then
+                        obj.Disabled = true
+                        task.wait(0.05)
+                        obj.Disabled = false
+                    end
+                end)
+                pcall(function()
+                    if typeof(getsenv) == "function" then
+                        local e = getsenv(obj)
+                        if e and e.Start then e.Start() end
+                    end
+                end)
+            end
+        end
+        notify(found and "Started" or "Not found")
+    end)
+end)
+
+-- ============ FARM TAB ============
+guard("farm", function()
+    -- ---- DROPS ----
+    -- add more drops here. "id" is the debug id from your snippet; debug ids change
+    -- between sessions, so if the exact id isn't found it falls back to the first
+    -- nil instance with that name.
+    local DROPS = {
+        {name = "Coin",       id = "1_200886"},
+        {name = "TrainerCap", id = "1_239393"},
+    }
+    local dropChance = 25
+
+    local function getNil(name, debugId)
+        if not getnilinstances then return nil end
+        for _, o in ipairs(getnilinstances()) do
+            if o.Name == name then
+                if not debugId or o:GetDebugId() == debugId then
+                    return o
+                end
+            end
+        end
+    end
+
+    local nilCache = {}
+    local function resolveDrop(d)
+        if nilCache[d.name] then return nilCache[d.name] end
+        local inst = getNil(d.name, d.id) or getNil(d.name)
+        nilCache[d.name] = inst
+        return inst
+    end
+
+    local function posOf(o)
+        if typeof(o) ~= "Instance" then return nil end
+        local ok, p = pcall(function()
+            if o:IsA("BasePart") then return o.Position end
+            if o:IsA("Model") then return o:GetPivot().Position end
+            if o:IsA("Tool") then
+                local h = o:FindFirstChild("Handle")
+                return h and h.Position
+            end
+        end)
+        return ok and p or nil
+    end
+
+    local function tpTo(p, fromDrop)
+        local root = getRoot()
+        if root and p then
+            root.CFrame = CFrame.new(p + Vector3.new(0, 3, 0))
+            if fromDrop then aiPauseUntil = tick() + 1.5 end
+        end
+    end
+
+    local function spawnDrop(d)
+        local ev = RS:FindFirstChild("SpawnDrop")
+        if not ev then notify("SpawnDrop remote not found") return false end
+        if not firesignal then notify("Your executor has no firesignal") return false end
+        local inst = resolveDrop(d)
+        if not inst then
+            notify("Couldn't find '" .. d.name .. "' (needs getnilinstances)")
+            return false
+        end
+        firesignal(ev.OnClientEvent, inst)
+        return true
+    end
+
+    local function rollDrop(fallbackPos)
+        local d = DROPS[math.random(#DROPS)]
+        local found
+        local c = WS.DescendantAdded:Connect(function(o)
+            if o.Name == d.name then found = o end
+        end)
+        local ok = spawnDrop(d)
+        task.wait(0.3)
+        c:Disconnect()
+        if ok and S.tpDrop then
+            tpTo(posOf(found) or fallbackPos, true)
+        end
+    end
+
+    local dropConn = nil
+    local function bindDropListener()
+        if dropConn then return true end
+        local ev = RS:FindFirstChild("SpawnDrop")
+        if not ev then return false end
+        dropConn = ev.OnClientEvent:Connect(function(obj)
+            if not S.tpDrop then return end
+            if typeof(obj) ~= "Instance" or not obj:IsDescendantOf(WS) then return end
+            task.wait(0.1)
+            tpTo(posOf(obj), true)
+        end)
+        track(dropConn)
+        return true
+    end
+
+    local hooked = setmetatable({}, {__mode = "k"})
+    local function hookEnemy(m, hum)
+        if hooked[m] then return end
+        hooked[m] = true
+        if hum.Health <= 0 then return end
+        track(hum.Died:Connect(function()
+            if not S.drops then return end
+            if math.random() * 100 > dropChance then return end
+            local ok, pos = pcall(function() return m:GetPivot().Position end)
+            task.spawn(rollDrop, ok and pos or nil)
+        end))
+    end
+
+    task.spawn(function()
+        while alive do
+            task.wait(1)
+            if S.drops then
+                for _, m in ipairs(WS:GetChildren()) do
+                    if m:IsA("Model") and m ~= LP.Character
+                    and Players:GetPlayerFromCharacter(m) == nil then
+                        local mh = m:FindFirstChildOfClass("Humanoid")
+                        if mh then hookEnemy(m, mh) end
+                    end
+                end
+            end
+        end
+    end)
+
+    heading(pFarm, "Drops")
+    toggle(pFarm, "Enemy Drops", function(v) S.drops = v end)
+    slider(pFarm, "Drop Chance %", 0, 100, dropChance, function(v) dropChance = v end)
+    toggle(pFarm, "Teleport to Drops", function(v)
+        S.tpDrop = v
+        if v and not bindDropListener() then
+            notify("SpawnDrop not found - only enemy drops teleport")
+        end
+    end)
+    button(pFarm, "Spawn Random Drop Now", function()
+        local root = getRoot()
+        task.spawn(rollDrop, root and root.Position or nil)
+    end)
+
+    -- ---- AUTO PICKUP ----
+    heading(pFarm, "Pickup")
+    local pickupMs, pickupRadius = 100, 200
+    toggle(pFarm, "Auto Pickup", function(v)
+        S.pickup = v
+        if not v then return end
+        runLoop("pickup", function() return pickupMs / 1000 end, function()
+            local root = getRoot()
+            if not root then return end
+            for _, o in ipairs(WS:GetDescendants()) do
+                if not S.pickup then break end
+                local part
+                if o:IsA("Tool") then
+                    part = o:FindFirstChild("Handle")
+                elseif o:IsA("BasePart") then
+                    local n = o.Name:lower()
+                    if n:find("drop") or n:find("coin") or n:find("item") or n:find("candy") then
+                        part = o
+                    end
+                elseif o:IsA("ProximityPrompt") then
+                    local pp = o.Parent
+                    if pp and pp:IsA("BasePart")
+                    and (pp.Position - root.Position).Magnitude < pickupRadius then
+                        pcall(fireproximityprompt, o)
+                    end
+                end
+                if part and part:IsA("BasePart")
+                and (part.Position - root.Position).Magnitude < pickupRadius then
+                    touch(root, part)
+                end
+            end
+        end)
+    end)
+    slider(pFarm, "Pickup Speed (ms)", 20, 1000, pickupMs, function(v) pickupMs = v end)
+    slider(pFarm, "Pickup Radius", 20, 500, pickupRadius, function(v) pickupRadius = v end)
+
+    -- ---- CANDY ----
+    heading(pFarm, "Candy")
+    local function isCandy(o)
+        local n = o.Name:lower()
+        return n:find("candycorn") or n:find("candybucket") or n:find("candypack")
+    end
+    local function candyPart(o)
+        return o:IsA("BasePart") and o
+            or o:FindFirstChild("Handle")
+            or o:FindFirstChildWhichIsA("BasePart")
+    end
+
+    toggle(pFarm, "Auto Candy (teleport to it)", function(v)
+        S.candy = v
+        if not v then return end
+        runLoop("candy", function() return 0.5 end, function()
+            local root = getRoot()
+            if not root then return end
+            for _, o in ipairs(WS:GetDescendants()) do
+                if not S.candy then break end
+                if isCandy(o) then
+                    local part = candyPart(o)
+                    if part then
+                        aiPauseUntil = tick() + 0.6
+                        root.CFrame = part.CFrame + Vector3.new(0, 2, 0)
+                        touch(root, part)
+                        task.wait(0.3)
+                    end
+                end
+            end
+        end)
+    end)
+
+    local bringRange = 150
+    toggle(pFarm, "Bring Candy to Me", function(v)
+        S.bringCandy = v
+        if not v then return end
+        runLoop("bringCandy", function() return 0.4 end, function()
+            local root = getRoot()
+            if not root then return end
+            local spot = root.CFrame * CFrame.new(0, 0, -3)
+            for _, o in ipairs(WS:GetDescendants()) do
+                if not S.bringCandy then break end
+                if isCandy(o) then
+                    local part = candyPart(o)
+                    if part and (part.Position - root.Position).Magnitude <= bringRange then
+                        pcall(function()
+                            if o:IsA("Model") then
+                                o:PivotTo(spot)
+                            else
+                                part.CFrame = spot
+                                part.AssemblyLinearVelocity = Vector3.zero
+                            end
+                        end)
+                        touch(root, part)
+                    end
+                end
+            end
+        end)
+    end)
+    slider(pFarm, "Bring Range", 20, 500, bringRange, function(v) bringRange = v end)
+
+    -- ---- SOULS / SPAWNABLES / PROMPTS ----
+    heading(pFarm, "Misc Farm")
+    toggle(pFarm, "Bring Souls to Me", function(v)
+        S.souls = v
+        if not v then return end
+        runLoop("souls", function() return 0.2 end, function()
+            local root = getRoot()
+            local misc = WS:FindFirstChild("Misc") or WS:FindFirstChild("misc")
+            if not root or not misc then return end
+            for _, o in ipairs(misc:GetDescendants()) do
+                if not S.souls then break end
+                if o.Name:lower():find("soul") then
+                    pcall(function()
+                        if o:IsA("BasePart") then
+                            o.CFrame = root.CFrame
+                        elseif o:IsA("Model") then
+                            o:PivotTo(root.CFrame)
+                        end
+                    end)
+                end
+            end
+        end)
+    end)
+
+    toggle(pFarm, "Spawnables -> Rakoof", function(v)
+        S.spawnables = v
+        if not v then return end
+        runLoop("spawnables", function() return 0.1 end, function()
+            local rk = getRakoof()
+            local rp = rk and partOf(rk)
+            local folder = WS:FindFirstChild("Spawnables") or WS:FindFirstChild("spawnables")
+            if not rp or not folder then return end
+            for _, o in ipairs(folder:GetDescendants()) do
+                if o:IsA("Model") then
+                    pcall(function() o:PivotTo(rp.CFrame) end)
+                elseif o:IsA("BasePart") and o.Parent == folder then
+                    o.CFrame = rp.CFrame
+                end
+            end
+        end)
+    end)
+
+    toggle(pFarm, "Auto Interact (all prompts)", function(v)
+        S.prompts = v
+        if not v then return end
+        runLoop("prompts", function() return 0.3 end, function()
+            for _, o in ipairs(WS:GetDescendants()) do
+                if not S.prompts then break end
+                if o:IsA("ProximityPrompt") then pcall(fireproximityprompt, o) end
+            end
+        end)
+    end)
+end)
+
+-- ============ PLAYER TAB ============
+guard("player", function()
+    heading(pPlayer, "Stamina")
+    local staminaCon = nil
+
+    local function getStaminaRemote()
+        local pr = RS:FindFirstChild("PlayerRemotes")
+        return pr and pr:FindFirstChild("SetStaminaValues")
+    end
+
+    local function fireStamina()
+        local Event = getStaminaRemote()
+        if not Event then return false end
+        firesignal(Event.OnClientEvent,
+            100,
+            15,
+            42,
+            999999
+        )
+        return true
+    end
+
+    local setStaminaUI
+    setStaminaUI = toggle(pPlayer, "Infinite Stamina", function(v)
+        if not v then
+            if staminaCon then staminaCon:Disconnect(); staminaCon = nil end
+            return
+        end
+        if not firesignal then
+            notify("Your executor has no firesignal")
+            setStaminaUI(false, true)
+            return
+        end
+        if not getStaminaRemote() then
+            notify("SetStaminaValues not loaded yet")
+            setStaminaUI(false, true)
+            return
+        end
+        staminaCon = RunService.RenderStepped:Connect(function()
+            pcall(fireStamina)
+        end)
+        track(staminaCon)
+    end)
+
+    button(pPlayer, "Refill Stamina (once)", function()
+        if not firesignal then notify("Your executor has no firesignal") return end
+        if not fireStamina() then notify("SetStaminaValues not loaded yet") end
+    end)
+
+    heading(pPlayer, "Survival")
+    toggle(pPlayer, "God Mode (health lock)", function(v)
+        S.god = v
+        if not v then return end
+        runLoop("god", function() return 0.2 end, function()
+            local _, hum = getRoot()
+            if hum then hum.Health = hum.MaxHealth end
+        end)
+    end)
+
+    local luckVal = 250
+    toggle(pPlayer, "Luck Boost (client only)", function(v)
+        S.luck = v
+        if not v then return end
+        runLoop("luck", function() return 0.5 end, function()
+            LP:SetAttribute("Luck", luckVal)
+            LP:SetAttribute("LuckMultiplier", luckVal)
+        end)
+    end)
+    slider(pPlayer, "Luck Multiplier", 1, 10000, luckVal, function(v) luckVal = v end)
+
+    heading(pPlayer, "Actions")
+    button(pPlayer, "Force Drop Item", function()
+        local hits = findRemote({"SpawnItem", "spawnitem", "SpawnItemRemote"})
+        if #hits == 0 then notify("No SpawnItem remote found") return end
+        local char = LP.Character
+        local tool = char and char:FindFirstChildOfClass("Tool")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not tool or not root then notify("Equip a tool first") return end
+        for _, r in ipairs(hits) do
+            pcall(function()
+                if r:IsA("RemoteEvent") then
+                    r:FireServer(tool.Name, root.Position)
+                elseif r:IsA("RemoteFunction") then
+                    r:InvokeServer(tool.Name, root.Position)
+                end
+            end)
+        end
+    end)
+end)
+
+-- ============ VISUALS TAB ============
+guard("visuals", function()
+    heading(pVis, "ESP")
+    local rakHL, plrHL = nil, {}
+
+    clearESP = function()
+        if rakHL then pcall(function() rakHL:Destroy() end); rakHL = nil end
+        for p, hl in pairs(plrHL) do
+            pcall(function() hl:Destroy() end)
+            plrHL[p] = nil
+        end
+    end
+
+    toggle(pVis, "Rakoof ESP", function(v) S.rakESP = v end)
+    toggle(pVis, "Player ESP", function(v) S.plrESP = v end)
+
+    task.spawn(function()
+        while alive do
+            task.wait(0.5)
+            pcall(function()
+                if S.rakESP then
+                    local rk = getRakoof()
+                    if rk and (not rakHL or rakHL.Parent ~= rk) then
+                        if rakHL then rakHL:Destroy() end
+                        rakHL = new("Highlight", {
+                            Name = tostring(math.random(100000, 999999)),
+                            FillColor = Color3.fromRGB(255, 0, 0),
+                            OutlineColor = Color3.new(1, 1, 1),
+                            FillTransparency = 0.4,
+                        }, rk)
+                    end
+                elseif rakHL then
+                    rakHL:Destroy()
+                    rakHL = nil
+                end
+
+                if S.plrESP then
+                    for _, p in ipairs(Players:GetPlayers()) do
+                        local ch = p ~= LP and p.Character
+                        if ch then
+                            local hl = plrHL[p]
+                            if not hl or hl.Parent ~= ch then
+                                if hl then hl:Destroy() end
+                                plrHL[p] = new("Highlight", {
+                                    Name = tostring(math.random(100000, 999999)),
+                                    FillColor = Color3.fromRGB(0, 255, 200),
+                                    OutlineColor = Color3.new(1, 1, 1),
+                                    FillTransparency = 0.5,
+                                }, ch)
+                            end
+                        end
+                    end
+                else
+                    for p, hl in pairs(plrHL) do
+                        hl:Destroy()
+                        plrHL[p] = nil
+                    end
+                end
+            end)
+        end
+    end)
+
+    heading(pVis, "World")
+    local orig = {
+        Ambient = Lighting.Ambient,
+        Brightness = Lighting.Brightness,
+        ClockTime = Lighting.ClockTime,
+        GlobalShadows = Lighting.GlobalShadows,
+    }
+    local fbOn = false
+    restoreLighting = function()
+        if not fbOn then return end
+        fbOn = false
+        pcall(function()
+            Lighting.Ambient = orig.Ambient
+            Lighting.Brightness = orig.Brightness
+            Lighting.ClockTime = orig.ClockTime
+            Lighting.GlobalShadows = orig.GlobalShadows
+        end)
+    end
+    toggle(pVis, "Full Bright", function(v)
+        if v then
+            fbOn = true
+            Lighting.Ambient = Color3.new(1, 1, 1)
+            Lighting.Brightness = 2
+            Lighting.ClockTime = 14
+            Lighting.GlobalShadows = false
+        else
+            restoreLighting()
+        end
+    end)
+end)
+
+-- ============ SETTINGS TAB ============
+guard("settings", function()
+    heading(pSettings, "Window")
+    button(pSettings, "Hide Window  (RightShift)", function() setVisible(false) end)
+    button(pSettings, "Remove Script", askRemove)
+
+    heading(pSettings, "Info")
+    info(pSettings, "RightShift, the \"-\" button or the round button on the left shows and hides this window.")
+    info(pSettings, "Use the search bar to filter the controls in the current tab.")
+end)
+
+print("[gui] loaded - RightShift, the '-' button, or the round button toggles the window")
