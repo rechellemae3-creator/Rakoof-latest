@@ -1,4 +1,4 @@
--- gui v11 (all-in-one: v10 + BananaHUB + NHOOK features)
+
 -- toggle: RightShift, the "-" button, or the round button on the left
 
 local env = (getgenv and getgenv()) or _G
